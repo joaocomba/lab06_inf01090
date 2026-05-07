@@ -1,0 +1,6 @@
+# Google service account credentials
+*.json
+# Streamlit secrets
+**/secrets.toml
+.streamlit/
+*/.streamlit/
