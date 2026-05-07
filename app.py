@@ -180,7 +180,10 @@ def validate_submission(df_sub, id_col, pred_col):
         n_missing = int(df_sub[pred_col].isna().sum())
         raise ValueError(f"Submission contains missing predictions: {n_missing}")
 
-    df_sub[pred_col] = pd.to_numeric(df_sub[pred_col], errors="ignore")
+    try:
+        df_sub[pred_col] = pd.to_numeric(df_sub[pred_col])
+    except Exception:
+        pass  # Keep as string/boolean if it cannot be parsed as numeric
 
     return df_sub
 
