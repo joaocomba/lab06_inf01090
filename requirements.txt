@@ -1,5 +1,6 @@
 streamlit>=1.28
 pandas
 numpy
+scikit-learn
 st-gsheets-connection
 gspread
