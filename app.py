@@ -5,6 +5,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import gspread
 from streamlit_gsheets import GSheetsConnection
 
 
@@ -98,22 +99,68 @@ def get_conn():
     return st.connection("gsheets", type=GSheetsConnection)
 
 
+def get_gspread_client():
+    """Get a gspread client using the same credentials as GSheetsConnection."""
+    if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
+        raise RuntimeError("Missing [connections.gsheets] in secrets.")
+    
+    # Extract only the keys needed for the service account
+    # (gspread might fail if extra keys like 'spreadsheet' are present in some versions)
+    creds = {
+        k: v for k, v in st.secrets["connections"]["gsheets"].items()
+        if k not in ["spreadsheet"]
+    }
+    return gspread.service_account_from_dict(creds)
+
+
+def append_to_worksheet(worksheet_name, data_row_dict):
+    """Safely append a single row to a worksheet using gspread."""
+    try:
+        gc = get_gspread_client()
+        spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        sh = gc.open_by_url(spreadsheet_url)
+        wks = sh.worksheet(worksheet_name)
+        
+        # Get headers to ensure correct column order
+        headers = wks.row_values(1)
+        if not headers:
+            # If sheet is totally empty, we can't append reliably by header
+            # Fallback to dict keys if we know them, but let's assume headers exist
+            raise ValueError(f"Worksheet '{worksheet_name}' has no headers.")
+            
+        row_to_append = [data_row_dict.get(h, "") for h in headers]
+        wks.append_row(row_to_append)
+    except Exception as e:
+        st.error(f"Failed to append to worksheet '{worksheet_name}': {e}")
+        raise e
+
+
 def load_worksheet(worksheet_name, columns):
     conn = get_conn()
     try:
         df = conn.read(worksheet=worksheet_name, ttl=0)
-        if df is None:
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=columns)
+        
         df = pd.DataFrame(df)
+        # Ensure all requested columns exist
         for col in columns:
             if col not in df.columns:
                 df[col] = pd.Series(dtype="object")
         return df[columns]
-    except Exception:
-        return pd.DataFrame(columns=columns)
+    except Exception as e:
+        # If it's a "worksheet not found" or similar, we might want to return empty
+        # but for general errors (timeout, etc), we should stop to avoid overwriting later.
+        st.error(f"Error loading worksheet '{worksheet_name}': {e}")
+        raise e
 
 
-def save_worksheet(worksheet_name, df):
+def save_worksheet(worksheet_name, df, allow_empty=False):
+    if not allow_empty and (df is None or df.empty):
+        # Prevent accidental clearing of the sheet
+        st.warning(f"Attempted to save an empty DataFrame to '{worksheet_name}'. Action aborted to prevent data loss. If you really want to clear the sheet, use the Instructor Tools.")
+        return
+    
     conn = get_conn()
     conn.update(worksheet=worksheet_name, data=df)
 
@@ -125,8 +172,8 @@ def load_leaderboard():
     )
 
 
-def save_leaderboard(df):
-    save_worksheet("leaderboard", df)
+def save_leaderboard(df, allow_empty=False):
+    save_worksheet("leaderboard", df, allow_empty=allow_empty)
 
 
 def load_history():
@@ -136,8 +183,8 @@ def load_history():
     )
 
 
-def save_history(df):
-    save_worksheet("history", df)
+def save_history(df, allow_empty=False):
+    save_worksheet("history", df, allow_empty=allow_empty)
 
 
 def normalize_leaderboard(df, lower_is_better=True):
@@ -226,32 +273,36 @@ def score_submission_df(df_sub, team, file_name, note=""):
     score = all_metrics[metric_name]
 
     # -------- leaderboard (best scores only, if configured)
-    leaderboard_row = pd.DataFrame([{
+    new_leaderboard_row = {
         "team": team,
         "score": score,
         "metric": metric_name,
         "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "file": file_name,
         "note": note,
-    }])
+    }
 
-    leaderboard = load_leaderboard().drop(columns=["rank"], errors="ignore")
+    # Load current leaderboard with error handling
+    try:
+        leaderboard = load_leaderboard().drop(columns=["rank"], errors="ignore")
+        
+        if leaderboard.empty:
+            leaderboard = pd.DataFrame([new_leaderboard_row])
+        else:
+            leaderboard = pd.concat([leaderboard, pd.DataFrame([new_leaderboard_row])], ignore_index=True)
 
-    if leaderboard.empty:
-        leaderboard = leaderboard_row.copy()
-    else:
-        leaderboard = pd.concat([leaderboard, leaderboard_row], ignore_index=True)
+        if keep_best:
+            leaderboard["score"] = pd.to_numeric(leaderboard["score"], errors="coerce")
+            leaderboard = leaderboard.sort_values("score", ascending=lower_is_better)
+            leaderboard = leaderboard.groupby("team", as_index=False).first()
 
-    if keep_best:
-        leaderboard["score"] = pd.to_numeric(leaderboard["score"], errors="coerce")
-        leaderboard = leaderboard.sort_values("score", ascending=lower_is_better)
-        leaderboard = leaderboard.groupby("team", as_index=False).first()
+        leaderboard = normalize_leaderboard(leaderboard, lower_is_better=lower_is_better)
+        save_leaderboard(leaderboard)
+    except Exception as e:
+        st.warning(f"Could not update leaderboard view: {e}. However, your submission was saved to history.")
 
-    leaderboard = normalize_leaderboard(leaderboard, lower_is_better=lower_is_better)
-    save_leaderboard(leaderboard)
-
-    # -------- full history (keep everything)
-    history_row = pd.DataFrame([{
+    # -------- full history (keep everything) - USE APPEND FOR SAFETY
+    history_row_dict = {
         "team": team,
         "accuracy": all_metrics["accuracy"],
         "f1_score": all_metrics["f1_score"],
@@ -260,15 +311,9 @@ def score_submission_df(df_sub, team, file_name, note=""):
         "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "file": file_name,
         "note": note,
-    }])
+    }
 
-    history = load_history()
-    if history.empty:
-        history = history_row.copy()
-    else:
-        history = pd.concat([history, history_row], ignore_index=True)
-
-    save_history(history)
+    append_to_worksheet("history", history_row_dict)
 
     return score, all_metrics
 
@@ -497,7 +542,7 @@ with st.expander("🔒 Instructor tools"):
                     empty_leaderboard = pd.DataFrame(
                         columns=["rank", "team", "score", "metric", "submitted_at", "file", "note"]
                     )
-                    save_leaderboard(empty_leaderboard)
+                    save_leaderboard(empty_leaderboard, allow_empty=True)
 
                     # 🔥 clear UI state
                     for key in ["evolution_teams", "evolution_metric"]:
@@ -512,7 +557,7 @@ with st.expander("🔒 Instructor tools"):
                     empty_history = pd.DataFrame(
                         columns=["team", "accuracy", "f1_score", "log_loss", "roc_auc", "submitted_at", "file", "note"]
                     )
-                    save_history(empty_history)
+                    save_history(empty_history, allow_empty=True)
 
                     # 🔥 clear UI state
                     for key in ["evolution_teams", "evolution_metric"]:
